@@ -1,0 +1,868 @@
+---
+title: "R5R-based Accessibility Analysis Framework"
+subtitle: "A case study of Amsterdam, Ghent, Milan, Munich, and Freising"
+output: 
+  html_notebook:
+    code_folding: hide
+    toc: yes
+    toc_float:
+      collapsed: FALSE
+---
+
+
+
+# Set Up
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(
+  comment = "#>", echo = TRUE, fig.width = 6, warning = FALSE, message =  FALSE 
+)
+
+library(tidyverse)
+library(sf)
+library(osmextract)
+options(java.parameters = "-Xmx4G") #"Always set the memory limit before loading the library, or that setting will have no effect." https://github.com/ipeaGIT/r5r/issues/170#issuecomment-842369304
+library(r5r)
+
+```
+
+## Data
+
+In the working directory populate the `cities` folder in the following way:
+
+```
+> classificationScheme.csv 
+> city
+  > admin_city.gpkg
+  > osm_study_city.osm.pbf
+```
+
+Where...
+
+* `classificationScheme.csv` specifies the standard POI classification scheme. More details in [POI Preperation].
+* `admin_city.gpkg` delineates area of interest for the study (administrative boundary)
+* `osm_study_city.osm.pbf` is an extract of raw OSM data, the basis for the R5R network and POIs.
+**To avoid edge effects this area must be at least as large as the study area**.
+
+The study area is defined as the bounding box of the administrative boundary buffered by 4000 m.
+
+## Additional Guidance for Preparing `.pbf` Files
+
+The `.pbf` file format is highly compressed, enabling bulk exports of OSM data. This is well suited
+for preparing POIs and is an input for R5R street network network generation. [Protomaps](https://protomaps.com/downloads/osm)
+is a good provider of this data as they allow for the area of the extract to be set by the user.
+However, these `.pbf` files may not include all OSM keys that are relevant for POI preparation.
+For this case study, a Europe-wide `.pbf` file was sourced from [Geofabrik](https://download.geofabrik.de/europe.html) on September 14, 2022. 
+A Europe-wide file was downloaded as some study areas overlapped multiple geographic regions. [Osmosis](https://wiki.openstreetmap.org/wiki/Osmosis) used for cropping the file into smaller, study-area-specific `.pbf` files. This may not be necessary in all cases, but excessively large `.pbf` files will negatively impact performance, particularly R5R. 
+
+### Osmosis Processing
+
+Osmosis processing was done in two steps:
+
+1. Crop the Europe-wide `.pbf` file to an area **larger** than the study area. In this case: the bounding box of the administrative boundary buffered by 5000 m
+2. Crop the `.pbf` file from step 1 to the study area, with `completeWays` and `completeRelations` enabled
+
+As previously mentioned, cropping is applied to improve performance. Enabling `completeWays` and 
+`completeRelations` prevents issues during R5R network generation. The two-step procedure is 
+implemented to avoid loading the entire Europe-wide `.pbf` file into a temporary folder [(forum post
+with more information)](https://dev.openstreetmap.narkive.com/MbbS199a/osm-osmosis-bug-when-using-completeways-option#post7). 
+
+**Osmosis Commands**
+```
+Step 1:
+# Amsterdam
+osmosis --read-pbf europe-latest.osm.pbf --bounding-box top=52.475590 left=4.656887 bottom=52.233411 right=5.152123 --write-pbf osm_study_buf_amsterdam.osm.pbf
+  
+# Freising
+osmosis --read-pbf europe-latest.osm.pbf --bounding-box top=48.49398 left=11.57318 bottom=48.28630 right=11.85997 --write-pbf osm_study_buf_freising.osm.pbf
+
+# Ghent
+osmosis --read-pbf europe-latest.osm.pbf --bounding-box top=51.230173 left=3.516289 bottom=50.936609 right=3.915450 --write-pbf osm_study_buf_ghent.osm.pbf
+
+# Milan
+osmosis --read-pbf europe-latest.osm.pbf --bounding-box top=45.580727 left=8.978080 bottom=45.342766 right=9.340711 --write-pbf osm_study_buf_milan.osm.pbf
+
+# Munich
+osmosis --read-pbf europe-latest.osm.pbf --bounding-box top=48.29310 left=11.29615 bottom=48.01718 right=11.78982 --write-pbf osm_study_buf_munich.osm.pbf
+
+
+Step 2:
+
+# Amsterdam
+osmosis --read-pbf osm_study_buf_amsterdam.osm.pbf --bounding-box top=52.46660 left=4.67130 bottom=52.24239 right=5.13753 completeWays=yes completeRelations=yes --write-pbf osm_study_amsterdam.osm.pbf
+  
+# Freising
+osmosis --read-pbf osm_study_buf_freising.osm.pbf --bounding-box top=48.48496 left=11.58663 bottom=48.29530 right=11.84648 completeWays=yes completeRelations=yes --write-pbf osm_study_freising.osm.pbf
+
+# Ghent
+osmosis --read-pbf osm_study_buf_ghent.osm.pbf --bounding-box top=51.221574 left=3.529212 bottom=50.945914 right=3.901797 completeWays=yes completeRelations=yes --write-pbf osm_study_ghent.osm.pbf
+
+# Milan
+osmosis --read-pbf osm_study_buf_milan.osm.pbf --bounding-box top=45.571751 left=8.990640 bottom=45.351561 right=9.328193 completeWays=yes completeRelations=yes --write-pbf osm_study_milan.osm.pbf
+
+# Munich
+osmosis --read-pbf osm_study_buf_munich.osm.pbf --bounding-box top=48.28410 left=11.30926 bottom=48.02607 right=11.77644 completeWays=yes completeRelations=yes --write-pbf osm_study_munich.osm.pbf
+
+
+```
+## Code Structure 
+```{r results='hide'}
+cities<-
+list.dirs("./cities",recursive = F,full.names = T)%>%
+  setNames(nm = (str_split(.,"/")%>%lapply(function(path)path[3])%>%unlist()))%>%
+  lapply(function(path){
+    city <-
+      list(path = path,
+           admin = list.files(path,"admin",full.names = T)%>%
+             st_read()%>%
+             select(name)
+           )
+    city$study <- city$admin%>%
+      st_transform(crs =3035)%>%
+      st_buffer(4000,joinStyle = "BEVEL")%>% # 4000 m = 15 min @ 16 km/hr
+      st_transform(crs = 4326)%>%
+      st_bbox()%>%
+      st_as_sfc()
+    
+    city
+  })
+
+#layers of interest (for parsing .pbf files)
+loi <- c("points",
+         "multipolygons"#,
+         #"other_relations"
+         )
+
+additional_koi <- c("name","operator","brand","origin") # keys needed for modifications to KOI classification
+
+poi_access_point_area_threshold <- units::set_units(40000,"m2")
+
+
+
+grid_resolution <- 100 # (meter) hex. grid
+
+# r5r parameters
+
+r5r_max_walk_time = 20L
+r5r_walk_speed = 5
+
+```
+
+## Prepare R5R Networks
+
+```{r results='hide'}
+
+#cities<-
+names(cities)%>%
+  setNames(names(cities))%>%
+  lapply(function(cityName){
+    
+    #!
+    # NEED TO REPORT R5R BUG: building multiple networks in single session: gtfs data is recycled
+    # despite changing path!! Temporarily, not important due to lack of PuT routing
+    # temp workaround: use different names for the gtfs feeds!!! (otherwise errors out)
+    # r5 Bundle contains duplicate feeds with feed ID
+    #!
+    
+    city<-cities[[cityName]]
+    
+    library(r5r)
+    
+    r5r_core<- setup_r5(data_path = city$path, verbose = FALSE)
+    
+    #city$sn <- street_network_to_sf(r5r_core)%>%.$edges #only save edges
+    
+    
+    #clean up r5r memory usage
+    stop_r5(r5r_core)
+    rJava::.jgc(R.gc = TRUE)
+    
+    city
+
+    })
+
+
+```
+
+
+## POI Preperation
+
+The `classificationScheme.csv` specifies the classification scheme and must contain the following columns:
+
+* `Active` Should the filter be applied (TRUE/FALSE)
+* `Class_A` Finest classification that is to be applied to the POI
+* `Filter` Expression passed to `dplyr::case_when()` call responsible for classifying the POIs. The `Filter` column is converted to `R_Filter` by replacing ":" with "\_" as keys with ":" are parsed as "\_" by `osmextract::oe_vectortranslate()`
+
+Columns starting with "Class_" will be retained and made available for accessibility calculations. These can represent higher-level classifications of the POIs.
+
+In the current implementation, each OSM feature represents a single POI. Therefore, **the order of POIs in `classificationScheme.csv` is important!** For example:
+OSM data may indicate that a business is both, a cafe and a bakery. By ordering `Cafe` before `Bakery`, precedence is given to the former classification.
+
+
+```{r include = FALSE}
+classificationScheme <-
+  read_csv("cities/classificationScheme.csv")%>%
+  filter(Active == T)%>% # active classes only
+  select(-Comments,-Active)%>%
+  mutate(Filter = str_squish(Filter))%>%
+  mutate(R_Filter = paste0(str_replace(Filter,":","_"),"~","'",Class_A,"'")) #convert ':' -> '_'  & append Class_A
+
+
+classificationSchemeFilter<-
+  classificationScheme%>%
+  .$R_Filter%>%
+  paste(collapse = ",")
+
+
+```
+
+## Classification Scheme Overview
+
+```{r}
+classificationScheme %>%
+  group_by(Class_C) %>%
+  summarise(`POI Classes` = length(unique(Class_B)), POIs = length(unique(Class_A))) %>%
+  arrange(desc(POIs)) %>%
+  rename(`Moreno Classification (Class_C)` = "Class_C")
+```
+### Full Classification Scheme
+```{r}
+classificationScheme
+```
+
+### Keys of Interest (KOI)
+
+The following keys are utilized by the classification scheme:
+
+```{r}
+# regex for extracting all OSM keys in classificationScheme
+# 
+koiExtractRegex <- paste0("(?<=(^|\\(|!|\\||\\&))[a-z_:]+(?=(==)|(%in%)|<|>|(<=)|(>=)|(!=)", # key defined as any number number of (lower case!) a-z characters and ':' which occur after the start of a string, '(', '!','|', or '&' and before the operators: '==', '%in%', '<', '>','<=',''>=','!='
+                          "|(>=)|(!=))|(?<=(\\())[a-z_:]+(?=\\))") # key defined as any number number of (lower case!) a-z characters and ':' nested between '(' and ')'
+
+temp_koi_extract<-
+classificationScheme%>%
+  mutate(Filter_KOI_Extract_Debug = Filter%>%
+           str_replace_all('[\'\"](.*?)[\'\"]',"___")%>% # remove everything within quotations (& replace w placeholder for easy viewing)
+           str_replace_all(" ",""), #remove whitespace,
+         KOI = Filter_KOI_Extract_Debug%>%str_extract_all(koiExtractRegex),
+         Filter_KOI_Extract_Debug = Filter_KOI_Extract_Debug%>%str_replace_all(koiExtractRegex,"VAR") # for easy viewing / verification
+           
+           ) 
+
+koi<-c(temp_koi_extract$KOI%>%unlist()%>%unique(),additional_koi)
+       
+koi_alt <- koi%>%str_replace_all(":","_") # for working with processed data (laundered keys)!
+
+
+koi
+  
+```
+
+**Debuging:**
+
+The automatic recognition of KOI using regex (above code chunk) is sensitive and may fail with unexpected filter formatting. The following table can be used to verify that KOI are being extracted correctly from classification scheme. Note that the regex implementation is for convienence, and can be replaced with a simple character vector `koi <- c('amenity','shop,...)` 
+
+```{r}
+temp_koi_extract%>%rowwise()%>%mutate(KOI = paste(unique(KOI),collapse = ","))%>%ungroup()
+```
+
+# Preparing POIs
+
+## Standard classification 
+
+The standard classification step involves applying the classification scheme to the parsed `.pbf` files.
+
+```{r results = "hide"}
+
+# slow in osmextract v0.4.1 (issue closed: https://github.com/ropensci/osmextract/issues/260)
+# can also look into .ini file to remove "laundering" keys (':' -> '_' conversion)
+cities<-
+  names(cities)%>%
+    setNames(names(cities))%>%
+    lapply(function(cityName){
+      
+      city<-cities[[cityName]]
+      
+      pbf_path <- list.files(city$path,".pbf$",full.names = T)
+      
+      city$pois <-
+    
+        loi%>%
+          lapply(function(layer){
+            
+            oe_read(pbf_path,
+                    extra_tags = c(koi),
+                    layer = layer)%>%
+              mutate(Class_A = 
+                       #https://stackoverflow.com/a/51764279
+                       eval(parse(text=sprintf("case_when(%s)",classificationSchemeFilter))))%>%
+              select(osm_id,Class_A,{{koi_alt}})%>%
+              bind_rows(koi_alt%>%as_tibble()%>%mutate(temp = NA)%>%pivot_wider(names_from = value,values_from = temp))%>% # account for missing keys! 
+              mutate(nKeys = rowSums(!is.na(across(koi_alt))),
+                     layer = layer)%>%
+              filter(!is.na(Class_A))
+          })%>%
+          bind_rows()%>%
+          mutate(city = cityName)%>%
+          left_join(classificationScheme%>%select(starts_with("Class")),
+                by = "Class_A")%>%
+        # fix geometries
+        st_make_valid()%>%
+        filter(st_is_valid(.))%>% # if they can't be fixed, remove (negligible)
+        filter(st_geometry_type(.) %in% c("POINT","POLYGON","MULTIPOLYGON"))
+      
+      
+      
+      city
+    })
+  
+```
+**Example POI Data**
+
+```{r echo=FALSE}
+
+cities$amsterdam$pois%>%head(5)
+
+```
+**POIS BY CITY**
+```{r echo=FALSE}
+cities%>%
+  lapply(function(city){
+    city$pois
+  })%>%
+  bind_rows()%>%
+  st_drop_geometry%>%
+  count(across(c(starts_with("Class"),"city")))%>%
+  pivot_wider(names_from = city, values_from = n)%>%
+  mutate(total = rowSums(across(!starts_with("Class")),na.rm = T))%>%
+  right_join(classificationScheme%>%select(starts_with("Class")))%>%
+  arrange(Class_C,Class_B,desc(total))
+```
+**POIS (CLASS_B,CLASS_C) BY CITY**
+```{r, echo=FALSE}
+cities%>%
+  lapply(function(city){
+    city$pois
+  })%>%
+  bind_rows()%>%
+  st_drop_geometry%>%
+  count(Class_C,Class_B,city)%>%
+  pivot_wider(names_from = city, values_from = n)%>%
+  mutate(total = rowSums(across(!starts_with("Class")),na.rm = T))%>%
+  right_join(classificationScheme%>%select(Class_B,Class_C)%>%distinct())%>%
+  arrange(Class_C,desc(total))
+```
+## Modifications
+
+Deviations from the standard classification scheme are applied here.
+
+<!-- ### Consolidate PuT Stops -->
+
+<!-- ```{r} -->
+<!-- 
+<!-- ``` -->
+
+
+### Refine Classification of Supermarkets
+
+Attempt to distinguish between smaller, local stores and major, chain supermarkets. While the latter 
+may be functionally the same, the data quality in OSM makes this difficult to determine. Most of the 
+time, such stores tend to be more specialized and may not be well suited to satisfying day-to-day shopping needs. 
+The implemented approach attempts to identify major chains by searching the `name`, `brand`, and `operator` keys of features
+tagged as supermarkets (excluding ethnic supermarkets). If one of the aggregated values occurs at least
+5 times, it is added to a list of "major supermarket names". If a **Supermarket** has a `name`, `brand`, or `operator`
+with a partial or full match to the list of "major supermarket names", it retains its classification.
+Otherwise, the feature is reclassified as a **Food Store** (`Class_A = 'Food Store', Class_B = 'Other Food Stores'`)
+
+
+
+**MAJOR SUPERMARKET NAMES**
+```{r}
+# NOTE: need to ensure that required keys are included in koi!
+
+majorSupermarketNames <-
+cities%>%
+  lapply(function(city){
+    city$pois
+  })%>%
+  bind_rows()%>%
+  st_drop_geometry()%>%
+  as_tibble()%>%
+  filter(shop == "supermarket")%>%
+  filter(is.na(origin))%>%  # ethnic supermarkets are excluded
+  # search name, brand, and operator tags for repeated entries
+  mutate(across(c("name","brand","operator"),str_to_lower))%>% # to lowercase (simpler text mining)
+  select(name,brand,operator)%>%mutate(present = T)%>%
+  pivot_longer(c("name","brand","operator"))%>%
+  .$value%>%
+  na.omit()%>%
+  paste()%>%
+  str_squish()%>% #remove excess white space (simpler text mining)
+  table()%>%
+  as_tibble()%>%
+  arrange(desc(n))%>%
+  filter(n >= 5)%>%.[[1]]
+
+majorSupermarketNames
+
+
+```
+**Updated POIs**
+
+```{r}
+majorSupermarketNames<-
+  majorSupermarketNames%>%
+  paste0("($|\\s).*") #match name then the end of the string OR a space
+
+cities<-
+  names(cities)%>%
+    setNames(names(cities))%>%
+    lapply(function(cityName){
+      
+      city<-cities[[cityName]]
+      
+      pbf_path <- list.files(city$path,".pbf$",full.names = T)
+      
+      city$pois <-
+
+        # apply update only to pois with shop == supermarket
+        city$pois%>%filter(shop == "supermarket")%>%
+          rowwise()%>%
+          mutate(Class_A = ifelse(is.na(origin) & (any(str_detect(str_to_lower(name)%>%replace_na(""),majorSupermarketNames)) |
+                                              any(str_detect(str_to_lower(brand)%>%replace_na(""),majorSupermarketNames)) |
+                                              any(str_detect(str_to_lower(operator)%>%replace_na(""),majorSupermarketNames))
+                                             ),
+                                Class_A,
+                                "Food Store"
+                                ))%>%
+          ungroup()%>%
+          mutate(Class_B = ifelse(Class_A == "Food Store","Other Food Stores",Class_B))%>% # update class B
+          bind_rows(city$pois%>%filter(shop != "supermarket" | is.na(shop)))%>% # reappend unmodified features
+        #AT END OF MODIFICATIONS
+        mutate(feature_id = 1:nrow(.))%>% 
+        select(c(starts_with("Class_"),"feature_id")) #drop unnecessary cols
+
+      city
+
+
+    })
+
+
+cities%>%
+    lapply(function(city){
+        city$pois
+    })%>%
+    bind_rows()%>%
+    st_drop_geometry()%>%count(Class_A,Class_B)%>%filter(Class_A %in% c("Supermarket","Food Store"))
+```
+
+
+# Accessibility Calculations
+
+## Create Grid
+
+100m resolution hexagon cells are generated for the study area.
+
+
+```{r}
+cities<-
+  names(cities)%>%
+    setNames(names(cities))%>%
+    lapply(function(cityName){
+      
+      city<-cities[[cityName]]
+      
+      city$grid <-
+      
+      st_make_grid(city$study%>%
+                     st_transform(crs = 3035),
+                   cellsize = c(100,100),
+                   square = F)%>%
+        st_sf()%>% #convert to sf object
+        mutate(grid_id = 1:nrow(.))
+      
+
+      city
+
+
+    })
+
+```
+
+**Example Grid**
+```{r echo=FALSE}
+
+cities$amsterdam$grid
+
+```
+
+
+## Assign POI Access Points to Grid Cells
+
+### Access Points
+
+Access points are defined for all POIs. Processing is dependent on the geometry of the POI:
+ 
+**ENTRANCES NOT CURRENTLY IMPLEMENTED**
+ 
+* `POINT`: feature geometry already represents its single access point
+* `POLYGON`: centroid and, if the area is equal or greater than `r poi_access_point_area_threshold/10000` ha, the intersections of the boundary and the street network (representing "entrances")
+* `MULTIPOLYGON`: the intersections of the boundary and the street network (representing "entrances") 
+
+
+All POI access points are assigned to the nearest cell. Duplicate access points are removed to avoid redundancy.
+
+
+```{r results='hide'}
+
+cities<-
+names(cities)%>%
+  setNames(names(cities))%>%
+  lapply(function(cityName){
+
+     
+    city<-cities[[cityName]]
+    
+    pois_access_points <- city$pois%>%
+      select(feature_id)%>%
+      st_centroid()%>%
+      st_filter(city$study) #access point must be within study area
+    
+    # # add required fields for processing
+    # tempPois<-city$pois%>%
+    #   select(feature_id)%>%
+    #   mutate(area = st_area(.))%>%
+    #   mutate(tempFilter = area >= poi_access_point_area_threshold | st_geometry_type(.) == "MULTIPOLYGON") # flag POIs meeting area threshold or multipolygon criteria
+    # 
+    # #get street network
+    # 
+    # r5r_core<- setup_r5(data_path = city$path, verbose = FALSE)
+    # 
+    # city_walk_net <- street_network_to_sf(r5r_core)%>%
+    #   .$edges%>%
+    #   filter(walk == T)
+    # 
+    # # find entrances for flagged POIs
+    # tempPoisEntrances <- tempPois%>%
+    #   filter(tempFilter == T)%>%
+    #   st_cast("MULTILINESTRING")
+    # 
+    # # narrow search space of street network
+    # city_walk_netTest<-
+    #   city_walk_net%>%
+    #   st_filter(tempPoisEntrances)
+    # 
+    # #entrances
+    # tempEntrances<-
+    #   st_intersection(city_walk_netTest%>%select(walk),
+    #                 tempPoisEntrances)%>%
+    #   select(-walk)
+    # 
+    # #clean up r5r memory usage
+    # rm(city_walk_net)
+    # stop_r5(r5r_core)
+    # rJava::.jgc(R.gc = TRUE)
+    # 
+    # # additionally determine centroid for all polygons (may include some of the flagged features)
+    # tempCentroids <-
+    #   tempPois%>%
+    #   filter(st_geometry_type(.) != "MULTIPOLYGON")%>%
+    #   st_centroid()
+    # 
+    # pois_access_points <- bind_rows(tempEntrances,tempCentroids)%>%
+    #   select(feature_id)%>%
+    #   st_filter(city$study) #access point must be within study area
+    # 
+    # 
+    # 
+    # pois_access_points
+    
+    grid_centroids <- 
+        city$grid%>%
+        st_centroid()%>%
+        st_transform(crs = 4326)
+      
+
+      # append nearest grid cell id
+      pois_access_points <-
+        pois_access_points%>%
+        mutate(NearestGridCell = grid_centroids$grid_id[st_nearest_feature(.,grid_centroids)])%>%
+        distinct() # remove multiple access points for a single grid cell
+      
+      city$pois_access_points <- pois_access_points
+
+      #enrich grid with access points summary   
+        
+      # city$grid_pois_access_points <- pois_access_points%>%
+      #   st_drop_geometry()%>%
+      #   left_join(city$pois%>%st_drop_geometry(), by = "feature_id")%>%
+      #   group_by(NearestGridCell)%>%
+      #   count(across(starts_with("Class_")))%>%
+      #   ungroup()%>%
+      #   rename(grid_id = "NearestGridCell")
+      
+      
+
+      city
+      
+
+    })
+
+
+
+
+
+
+
+
+
+```
+
+**Example POI Access Points**
+```{r echo=FALSE}
+cities$amsterdam$pois_access_points%>%head()
+```
+
+
+## Travel Time Matrix
+
+A travel time matrix with from cells within the administrative area to cells within the study area (which have at least 1 POI access point) is determined. The following parameters are used:
+
+* max walking time: `r r5r_max_walk_time`
+* walk speed: `r r5r_walk_speed` km/hr
+
+```{r results='hide'}
+cities<-
+  names(cities)%>%
+    setNames(names(cities))%>%
+    lapply(function(cityName){
+        
+      city<-cities[[cityName]]
+        
+      r5r_core <- setup_r5(data_path = city$path, verbose = FALSE) 
+      
+      grid_centroids <- 
+        city$grid%>%
+        st_centroid()%>%
+        st_transform(crs = 4326)
+      
+      
+      o_points <- 
+        grid_centroids%>%
+        st_filter(city$admin)   #APPLY ADMINISTRATIVE BOUNDARY FILTER!
+        
+      o_points<-
+        st_coordinates(o_points)%>%
+        as_tibble()%>%
+        mutate(id = o_points$grid_id) %>%
+        rename(lon = "X", lat = "Y")
+      
+      d_points <-
+        grid_centroids%>%
+        filter(grid_id %in% (city$pois_access_points$NearestGridCell%>%unique())) # cell must at least have one poi access point
+      
+      d_points <-
+        st_coordinates(d_points)%>%
+        as_tibble() %>%
+        mutate(id = d_points$grid_id) %>%
+        rename(lon = "X", lat = "Y")
+      
+      
+      
+      # calculate ttm from grid points within the admin boundary to grid points within study area
+      grid_ttm <-
+        travel_time_matrix(
+          r5r_core = r5r_core,
+          origins = o_points,
+          destinations = d_points,
+          mode = "WALK",
+          mode_egress = "WALK",
+          departure_datetime = as.POSIXct("15-09-2008 12:00:00",format = "%d-%m-%Y %H:%M:%S"), # must be within GTFS,using dummy data (to avoid an upstream r5 bug)
+          time_window = 1L,
+          percentiles = 50L,
+          fare_structure = NULL,
+          max_fare = Inf,
+          max_walk_time = r5r_max_walk_time, 
+          max_bike_time = Inf,
+          max_trip_duration = r5r_max_walk_time,
+          walk_speed = r5r_walk_speed,
+          bike_speed = 12,
+          max_rides = 10,
+          max_lts = 2,
+          draws_per_minute = 5L,
+          n_threads = Inf,
+          verbose = FALSE,
+          progress = FALSE,
+          output_dir = NULL
+        )
+      
+        
+      #clean up r5r memory usage
+      stop_r5(r5r_core)
+      rJava::.jgc(R.gc = TRUE)
+      
+      
+      city$grid_ttm <- grid_ttm%>%
+        mutate(from_id = as.integer(from_id),to_id = as.integer(to_id))
+      
+      city
+
+
+
+  
+      })
+```
+
+**Example TTM**
+
+```{r echo=FALSE}
+
+cities$amsterdam$grid_ttm%>%head(5)
+
+```
+
+
+## POIs associated with Travel Time Matrix
+
+POI **access points** are joined to the travel time matrix. For each origin, POI pair: the **nearest** access point is retained.
+The resulting data frame enables accessibility metric calculations. This data frame is written to `results/grid_ttm_access.csv` and has the following columns:
+
+* `from_id`: origin grid cell
+* `to_id`: destination grid cell
+* `Class_C`
+* `Class_B`
+* `travel_time_p50`: travel time from origin to destination grid cell
+* `n`: number of POIs reached at `travel_time_p50`
+* `cum_pois`: cumulative number of POIs reached at `travel_time_p50`
+
+
+
+```{r results='hide'}
+for (cityName in names(cities)){
+  print(cityName)
+  
+  #process in chunks
+  grid_cells <- cities[[cityName]]$grid_ttm$from_id%>%unique()
+  
+  grid_ttm_access<-
+  split(grid_cells, ceiling(seq_along(grid_cells)/5000))%>% # process in chunks of 5000 origin cells
+    lapply(function(chunk){
+      
+      # join access points to ttm  
+      grid_ttm_access<-
+      cities[[cityName]]$grid_ttm%>%
+        filter(from_id %in% chunk)%>%
+        left_join(cities[[cityName]]$pois_access_points%>%
+                    st_drop_geometry()%>%
+                    rename(to_id = "NearestGridCell"),
+                  by = "to_id")%>%
+        filter(!is.na(feature_id))%>% # remove cells without access points
+        group_by(from_id,feature_id)%>%
+        mutate(n_access_points = length(feature_id))%>%
+        ungroup()
+        
+      # retain nearest access_point for each origin, POI pair
+      
+      grid_ttm_access<-
+      grid_ttm_access%>%
+        filter(n_access_points > 1)%>%
+        group_by(from_id,feature_id)%>% # retain nearest access_point for each origin, POI pair
+        slice_min(travel_time_p50,with_ties = F)%>%
+        ungroup()%>%
+        bind_rows(
+          # re-join origin, POI pairs without multiple access_points
+          grid_ttm_access%>%
+            filter(n_access_points == 1)
+        )%>%
+        select(-n_access_points)
+        
+      grid_ttm_access<-
+      grid_ttm_access%>%
+        left_join(cities[[cityName]]$pois%>%
+                    st_drop_geometry(), by = "feature_id")%>% # join POI data
+        count(from_id,Class_C,Class_B,travel_time_p50)
+      
+      
+      grid_ttm_access%>%
+        group_by(from_id,Class_C,Class_B)%>%
+        arrange(travel_time_p50)%>%
+        mutate(cum_pois = cumsum(n))%>%
+        ungroup()
+      
+      
+    })%>%
+    bind_rows()
+    
+  
+      
+
+      grid_ttm_access_path <- cities[[cityName]]$path%>%paste0("/results/grid_ttm_access.csv")
+      
+      #too large to store in memory!
+      write_csv(grid_ttm_access,grid_ttm_access_path)
+      
+      rm(grid_ttm_access)
+
+      cities[[cityName]]$grid_ttm_access_path <- grid_ttm_access_path
+    
+      
+}
+
+```
+## Accessibility Metric Calculation
+
+**(Play with `results/grid_ttm_access.csv` to get desired result)**
+
+`accessibility_min_tt` provides the minimum travel time to reach each `Class_C` POI (20 min max). Additionally:
+* An average, minimum travel time is computed (`mean_min_tt`)
+* # of Moreno classes with at least 1 POI accessible within 20 minutes (`n`)
+
+
+```{r results='hide'}
+cities<-
+  names(cities)%>%
+    setNames(names(cities))%>%
+    lapply(function(cityName){
+      
+      city<-cities[[cityName]]
+      
+      
+      # mean, minimum time to reach a POI Class B
+      
+      
+      accessibility_min_tt <-
+  
+        read_csv(city$grid_ttm_access_path)%>%
+          group_by(from_id,Class_C,Class_B)%>%
+          summarise(min_tt = min(travel_time_p50))%>%
+          group_by(from_id,Class_C)%>%
+          summarise(mean_min_tt = mean(min_tt))%>%
+          pivot_wider(names_from = Class_C,values_from = mean_min_tt)%>%
+          mutate(mean_min_tt = rowMeans(across(!matches("from_id")),na.rm = T),
+                 n = rowSums(!is.na(across(!matches("from_id|mean_min_tt")))))%>%
+          ungroup()%>%
+        rename(grid_id = "from_id")%>%
+        # join grid
+        right_join(city$grid, by = "grid_id")
+        
+      
+      st_write(accessibility_min_tt,
+               cities[[cityName]]$path%>%paste0("/results/acccesibility_min_tt.gpkg"),
+               append = F)
+      
+      city$accessibility_min_tt <- accessibility_min_tt
+      
+      city
+      
+
+    })
+
+```
+
+**Example**
+```{r echo=FALSE}
+cities$amsterdam$accessibility_min_tt%>%head(5)
+```
+
+

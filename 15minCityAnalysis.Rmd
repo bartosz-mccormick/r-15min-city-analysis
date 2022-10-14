@@ -1,6 +1,6 @@
 ---
 title: "R5R-based Accessibility Analysis Framework"
-subtitle: "A case study of Amsterdam, Ghent, Milan, Munich, and Freising"
+subtitle: "A case study of Amsterdam, Ghent, Madrid, Milan, and Munich"
 output: 
   html_notebook:
     code_folding: hide
@@ -73,8 +73,8 @@ Step 1:
 # Amsterdam
 osmosis --read-pbf europe-latest.osm.pbf --bounding-box top=52.475590 left=4.656887 bottom=52.233411 right=5.152123 --write-pbf osm_study_buf_amsterdam.osm.pbf
   
-# Freising
-osmosis --read-pbf europe-latest.osm.pbf --bounding-box top=48.49398 left=11.57318 bottom=48.28630 right=11.85997 --write-pbf osm_study_buf_freising.osm.pbf
+<!-- # Freising -->
+<!-- osmosis --read-pbf europe-latest.osm.pbf --bounding-box top=48.49398 left=11.57318 bottom=48.28630 right=11.85997 --write-pbf osm_study_buf_freising.osm.pbf -->
 
 # Ghent
 osmosis --read-pbf europe-latest.osm.pbf --bounding-box top=51.230173 left=3.516289 bottom=50.936609 right=3.915450 --write-pbf osm_study_buf_ghent.osm.pbf
@@ -91,8 +91,8 @@ Step 2:
 # Amsterdam
 osmosis --read-pbf osm_study_buf_amsterdam.osm.pbf --bounding-box top=52.46660 left=4.67130 bottom=52.24239 right=5.13753 completeWays=yes completeRelations=yes --write-pbf osm_study_amsterdam.osm.pbf
   
-# Freising
-osmosis --read-pbf osm_study_buf_freising.osm.pbf --bounding-box top=48.48496 left=11.58663 bottom=48.29530 right=11.84648 completeWays=yes completeRelations=yes --write-pbf osm_study_freising.osm.pbf
+<!-- # Freising -->
+<!-- osmosis --read-pbf osm_study_buf_freising.osm.pbf --bounding-box top=48.48496 left=11.58663 bottom=48.29530 right=11.84648 completeWays=yes completeRelations=yes --write-pbf osm_study_freising.osm.pbf -->
 
 # Ghent
 osmosis --read-pbf osm_study_buf_ghent.osm.pbf --bounding-box top=51.221574 left=3.529212 bottom=50.945914 right=3.901797 completeWays=yes completeRelations=yes --write-pbf osm_study_ghent.osm.pbf
@@ -133,7 +133,8 @@ loi <- c("points",
          #"other_relations"
          )
 
-additional_koi <- c("name","operator","brand","origin") # keys needed for modifications to KOI classification
+additional_koi <- c("name","operator","brand","origin", # additional keys needed (modifying POI classification)
+                    "building","tourism","landuse","amenity") # additional keys needed (residential building identification)
 
 poi_access_point_area_threshold <- units::set_units(40000,"m2")
 
@@ -145,6 +146,10 @@ grid_resolution <- 100 # (meter) hex. grid
 
 r5r_max_walk_time = 20L
 r5r_walk_speed = 5
+
+# define level of marginal accessibility 
+## corresponds to # POI Class_Bs that must be reached (>=) within r5r_max_walk_time
+marginal_accessibility_threshold <- 20
 
 ```
 
@@ -250,7 +255,7 @@ classificationScheme%>%
            
            ) 
 
-koi<-c(temp_koi_extract$KOI%>%unlist()%>%unique(),additional_koi)
+koi<-c(temp_koi_extract$KOI%>%unlist()%>%unique(),additional_koi)%>%unique()
        
 koi_alt <- koi%>%str_replace_all(":","_") # for working with processed data (laundered keys)!
 
@@ -322,7 +327,7 @@ cities<-
 
 ```{r echo=FALSE}
 
-cities$amsterdam$pois%>%head(5)
+cities[[1]]$pois%>%head(5)
 
 ```
 **POIS BY CITY**
@@ -458,6 +463,7 @@ cities%>%
 ```
 
 
+
 # Accessibility Calculations
 
 ## Create Grid
@@ -482,9 +488,8 @@ cities<-
         st_sf()%>% #convert to sf object
         mutate(grid_id = 1:nrow(.))
       
-
       city
-
+      
 
     })
 
@@ -493,9 +498,11 @@ cities<-
 **Example Grid**
 ```{r echo=FALSE}
 
-cities$amsterdam$grid
+cities[[1]]$grid%>%head(5)
 
 ```
+
+
 
 
 ## Assign POI Access Points to Grid Cells
@@ -621,7 +628,7 @@ names(cities)%>%
 
 **Example POI Access Points**
 ```{r echo=FALSE}
-cities$amsterdam$pois_access_points%>%head()
+cities[[1]]$pois_access_points%>%head()
 ```
 
 
@@ -704,6 +711,8 @@ cities<-
       
       
       city$grid_ttm <- grid_ttm%>%
+        filter(from_id != to_id)%>% # remove travel time from origin to itself
+        bind_rows(tibble(from_id = as.character(o_points$id), travel_time_p50 = 0)%>%mutate(to_id = from_id))%>% # reintroduce travel time from origin to itself with tt=0. Removes gaps in final output
         mutate(from_id = as.integer(from_id),to_id = as.integer(to_id))
       
       city
@@ -718,7 +727,7 @@ cities<-
 
 ```{r echo=FALSE}
 
-cities$amsterdam$grid_ttm%>%head(5)
+cities[[1]]$grid_ttm%>%head(5)
 
 ```
 
@@ -739,6 +748,8 @@ The resulting data frame enables accessibility metric calculations. This data fr
 
 
 ```{r results='hide'}
+# add code to create results folder if it is missing
+
 for (cityName in names(cities)){
   print(cityName)
   
@@ -810,6 +821,187 @@ for (cityName in names(cities)){
 }
 
 ```
+
+# Population Disaggregation
+
+## Residential Buildings
+Identifying residential buildlings enables population disaggregation. Areas are aggreagted at grid cells level
+```{r results = "hide"}
+
+cities<-
+  names(cities)%>%
+    setNames(names(cities))%>%
+    lapply(function(cityName){
+      
+      city<-cities[[cityName]]
+      
+      gpkg_path <-list.files(city$path,list.files(city$path,".pbf$")%>%str_split(".osm.pbf")%>%unlist()%>%first()%>%paste0(".gpkg"),full.names = T)
+      
+      RB_data<-
+      st_read(gpkg_path, layer = "multipolygons")%>%
+        select(c("building","tourism","landuse","amenity"))%>%
+        #fix geometries
+        st_make_valid()%>%
+        filter(st_is_valid(.))%>% # if they can't be fixed, remove (negligible)
+        filter(st_geometry_type(.) %in% c("POLYGON","MULTIPOLYGON"))%>%
+        mutate(area = st_area(.))
+
+
+      residential_landuse <- RB_data%>%
+        filter(landuse == "residential")
+      
+      blacklist <- RB_data%>%
+        filter(landuse %in% c("farmyard","construction","farmland","quarry","industrial","retail","commercial","forest","military", "cemetery",
+                                "landfill","allotments","recreation ground","railway","parking","grass","grassland","green","garages") |
+                 tourism %in% c("zoo") |
+                 amenity %in% c("hospital","university","community_centre","school","kindergarten","recreation_ground","wood"))
+      
+      
+      # 1. potential residential buildings as polygons with building key in approved types
+      
+      potential_RB <- 
+        RB_data %>%
+        filter(building %in% c("apartments", "bungalow", "detached", "dormitory", "residential", "house", "terrace", "home", "semidetached_house"))
+        
+      
+      # 2. also consider ...
+      
+      potential_RB <-
+        potential_RB%>%
+        bind_rows(
+          RB_data%>%
+            filter(building == "yes")%>% # polygons with building = "yes"
+            filter(area >= units::set_units(20,"m2"))%>% #area at least 20 m2
+            mutate(inResidential = st_intersects(.,residential_landuse)%>%lengths)%>%
+            filter(inResidential > 0)%>% # intersects with "residential" landuse
+            mutate(building = "residential")
+        )
+      
+      # 3. Remove buildings that intersect "blacklist" landuse (this can be some POIs like schools) 
+      
+      RB <-
+      potential_RB%>%
+        mutate(inBlacklist = st_intersects(.,blacklist)%>%lengths)%>%
+            filter(inBlacklist == 0)%>% # intersects with "residential" landuse
+        select(building,area)%>%
+       st_centroid()
+     
+     grid <- city$grid%>%st_transform(crs = st_crs(4326))
+     
+     RB$grid_id <-
+        grid$grid_id[
+          st_within(RB,grid)%>%
+            lapply(function(index){
+              ifelse(length(index == 1),index,NA)})%>%
+            unlist() # if no match, replace empty vector with NA
+        ]
+     
+     # residential building area aggregated at grid level
+     city$grid_RB_area <- RB%>%
+       st_drop_geometry()%>%
+       group_by(grid_id)%>%
+       summarise(area = sum(units::set_units(area,"m2")%>%as.numeric()))
+      
+
+      city
+    })
+  
+```
+
+**Example Residential Building Area**
+```{r echo=FALSE}
+
+cities[[1]]$RB_area_grid%>%head(5)
+
+```
+
+## Population Data
+
+Required input is a geopackage with "population" in the name. The geopackage must have polygons of city
+districts with the associated population. The population must be in a field named "population"
+
+Population data will not be disaggregated for cities without the required input data.
+
+```{r results = "hide"}
+
+cities<-
+  names(cities)%>%
+    setNames(names(cities))%>%
+    lapply(function(cityName){
+      
+      city<-cities[[cityName]]
+      
+      gpkg_path <-list.files(city$path,"*population*", full.names = T)
+      
+      if(length(gpkg_path) == 0){
+        city$grid_population <- list(NULL)
+        return(city) # skip city if data unavailable
+      }
+      
+      population_data<- st_read(gpkg_path)
+      
+      if("population" %in% names(population_data) == F){
+        city$grid_population <- list(NULL)
+        return(city) #skip if population field not in data
+      }
+      
+      population_data<-
+      population_data%>%
+        st_transform(crs = 4326)%>%
+        select(population)%>%
+        mutate(population = replace_na(population,0))%>% # replace NA pop with 0
+        mutate(pop_id = 1:length(population)) #based on city district
+      
+      # assign pop_id (city district) to grid cells
+      
+      grid <- city$grid%>%
+        st_transform(crs = st_crs(4326))%>%
+        st_centroid()
+     
+      grid$pop_id <- 
+        population_data$pop_id[
+          st_within(grid,population_data)%>%
+            lapply(function(index){
+              ifelse(length(index == 1),index,NA)})%>%
+            unlist() # if no match, replace empty vector with NA
+        ]
+      
+      # join residential building area to grid
+      
+      grid<-
+        grid %>%
+        st_drop_geometry()%>%
+        left_join(city$grid_RB_area, by = "grid_id")
+      
+      pop_ratios <-
+        grid%>%
+          group_by(pop_id)%>%
+          summarise(area = sum(area,na.rm = T))%>% # summarise area by pop_id
+          # join population from each pop_id
+          left_join(population_data%>%
+                      st_drop_geometry(), by = "pop_id")%>%
+          mutate(pop_r = population/area)%>% 
+          mutate(pop_r=ifelse(is.infinite(pop_r),0,pop_r))%>% # replace infinite ratios (non-0 population, 0 area)
+          filter(!is.na(pop_id)) #remove cells not within a city district
+      
+      
+      # join ratio to grid and calculate disaggregated population
+      
+      grid<-
+      grid%>%
+        left_join(pop_ratios%>%select(pop_r,pop_id), by = "pop_id")%>%
+        mutate(population = area*pop_r)%>%
+        select(grid_id,population)
+      
+      city$grid_population <- grid%>%as_tibble()
+      
+      city
+      
+    })
+  
+```
+
+
 ## Accessibility Metric Calculation
 
 **(Play with `results/grid_ttm_access.csv` to get desired result)**
@@ -827,31 +1019,110 @@ cities<-
       
       city<-cities[[cityName]]
       
+      #min travel time to each Class_B 
+      min_tt <-city$grid_ttm_access_path%>%  
+        read_csv()%>%
+        group_by(from_id,Class_C,Class_B)%>%
+        summarise(min_tt = min(travel_time_p50))%>%
+        ungroup()
       
-      # mean, minimum time to reach a POI Class B
-      
-      
+      # marginal accessibility status of cells (T/F)
+      marginal_accessibility <- 
+      min_tt%>%
+        group_by(from_id)%>%
+        summarise(nClass_C = length(unique(Class_C)),
+                  nClass_B = length(Class_B),
+                  meanMin_tt = mean(min_tt))%>% # mean min travel time to all accessible POIs
+        # for marginal accessibility all moreno classifications (Class_C) have to be reached
+        # AND the number of accessible POI Class_Bs that can be reached meets the marginal accessibility threshold is met
+        mutate(meets_marginal_accessiblility = 
+                 nClass_C == (classificationScheme$Class_C%>%unique()%>%length) &
+                 nClass_B >= marginal_accessibility_threshold)
+
       accessibility_min_tt <-
-  
-        read_csv(city$grid_ttm_access_path)%>%
-          group_by(from_id,Class_C,Class_B)%>%
-          summarise(min_tt = min(travel_time_p50))%>%
-          group_by(from_id,Class_C)%>%
-          summarise(mean_min_tt = mean(min_tt))%>%
-          pivot_wider(names_from = Class_C,values_from = mean_min_tt)%>%
-          mutate(mean_min_tt = rowMeans(across(!matches("from_id")),na.rm = T),
-                 n = rowSums(!is.na(across(!matches("from_id|mean_min_tt")))))%>%
-          ungroup()%>%
+      min_tt%>%
+        group_by(from_id,Class_C)%>%
+        summarise(meanMin_tt = mean(min_tt))%>%  # mean min travel time to all accessible POIs (PER CLASS_C) 
+        ungroup()%>%
+        pivot_wider(names_from = Class_C, values_from = meanMin_tt)%>%
+        right_join(marginal_accessibility, by = "from_id")%>%
+        mutate(meanMin_tt = ifelse(meets_marginal_accessiblility,meanMin_tt,NA))%>% # set meanMin_tt to NA if marginal accessibility threshold isn't met
         rename(grid_id = "from_id")%>%
-        # join grid
-        right_join(city$grid, by = "grid_id")
+      
+        # bin the data (travel time for cells with marginal accessibility met, nClass_B for all data)
+        mutate(nClass_B_bin = cut(nClass_B,seq(0,ceiling((classificationScheme$Class_B%>%unique()%>%length)/5)*5,5),right = T, include.lowest = F ),
+               meanMin_tt_bin = cut(meanMin_tt,seq(0,ceiling(r5r_max_walk_time/5)*5,5),right = T, include.lowest = F))
+      
+      
+      # join grid (cells within study area)
+      accessibility_min_tt<-
+        left_join(city$grid%>%filter(grid_id %in% (city$grid_ttm$from_id%>%unique())),
+                  accessibility_min_tt ,by = "grid_id")
+      
+      # fill in missing values (cells within study area with 0 access)
+      
+      i_na_meets_marginal_accessibility <- is.na(accessibility_min_tt$meets_marginal_accessiblility)
+      
+      accessibility_min_tt$nClass_B[i_na_meets_marginal_accessibility] <- 0
+      accessibility_min_tt$nClass_C[i_na_meets_marginal_accessibility] <- 0
+      accessibility_min_tt$nClass_B_bin[i_na_meets_marginal_accessibility] <- accessibility_min_tt$nClass_B_bin%>%levels()%>%first
+      accessibility_min_tt$meets_marginal_accessiblility[i_na_meets_marginal_accessibility] <- F
+
+      
+      #apply accessibility classification
+      
+      accessibility_min_tt<- 
+        accessibility_min_tt%>%
+        mutate(accessibility_class = ifelse(meets_marginal_accessiblility, # class is the travel time bin if marginal accessibility threshold is met, otherwise it is the nClass_B bin
+                                            as.character(meanMin_tt_bin)%>%paste("min."),
+                                            as.character(nClass_B_bin)%>%paste("POI Classes")))%>%
+                 mutate(accessibility_class = ifelse(nClass_B == 0,"0 POI Classes",accessibility_class)%>% #add special class for 0 reachable POIs
+                          factor(levels = c("0 POI Classes",
+                                   accessibility_min_tt$nClass_B_bin%>%levels%>%paste("POI Classes"),
+                                   accessibility_min_tt$meanMin_tt_bin%>%levels%>%paste("min."))))
+                 
+      
+      
+      # CLEAN UP FINAL nClass Bin (so it ends at maximum value)
+      
+      # nClass_B_bin_levels <- accessibility_min_tt$nClass_B_bin%>%levels
+      # 
+      # accessibility_min_tt%>%
+      #   mutate(nClass_B_bin = as.character(nClass_B_bin))%>%
+      #   mutate(nClass_B_bin = ifelse(nClass_B_bin != nClass_B_bin_levels%>%last(), #check if equal to max level
+      #                 str_replace(nClass_B_bin,",\\d*]",paste0(",",(classificationScheme$Class_B%>%unique()%>%length),"]")),
+      #                 nClass_B_bin))
+    
+
+
+      
+      
+
         
+
+      
+      # ENRICH W POPULATION DATA
+      
+      grid_population <- city$grid_population
+      
+      #join population data
+      if(!is_tibble(grid_population)){ #if population data is unavailable
+        accessibility_min_tt <- accessibility_min_tt%>%
+          mutate(population = NA)
+        
+      } else{
+        
+        accessibility_min_tt <- accessibility_min_tt%>%
+          left_join(city$grid_population, by = "grid_id")
+      }
+      
       
       st_write(accessibility_min_tt,
-               cities[[cityName]]$path%>%paste0("/results/acccesibility_min_tt.gpkg"),
-               append = F)
-      
+         city$path%>%paste0("/results/acccesibility_min_tt.gpkg"),
+         append = F)
+
       city$accessibility_min_tt <- accessibility_min_tt
+      
       
       city
       
@@ -862,7 +1133,96 @@ cities<-
 
 **Example**
 ```{r echo=FALSE}
-cities$amsterdam$accessibility_min_tt%>%head(5)
+cities[[1]]$accessibility_min_tt%>%head(5)
 ```
+# Accessibility Summary
+
+* Area-based
+* Population-based (if available)
+
+```{r results='hide'}
+cities<-
+  names(cities)%>%
+    setNames(names(cities))%>%
+    lapply(function(cityName){
+      
+      city<-cities[[cityName]]
+      
+      cell_area <- city$accessibility_min_tt%>%st_area()%>%first()%>%units::set_units("m2")%>%as.numeric() #m2
+      
+      city_pop <- city$accessibility_min_tt$population%>%sum(na.rm = T)
+      city_area <- length(city$accessibility_min_tt$grid_id)*cell_area
+      
+      applySummary <- function(data){
+        data%>%
+          summarise(population = sum(population,na.rm = T),
+                    area = length(grid_id)*cell_area)%>%
+          mutate(rel_population = population/city_pop,
+                 rel_area = area / sum(city_area))%>%
+          ungroup()
+      }
+      
+      accessibility_min_tt<-
+      city$accessibility_min_tt%>%
+        st_drop_geometry()%>%
+        as_tibble()
+      
+      # POI class summary
+      POI_accessibility_summary<-
+      accessibility_min_tt%>%
+        group_by(nClass_B_bin)%>%
+        applySummary()
+
+      #marginal accessibility summary
+      marginal_accessibility_summary<-
+        accessibility_min_tt%>%
+        group_by(meets_marginal_accessiblility)%>%
+        applySummary()
+      
+      
+      # mean min tt summary
+      meanMin_tt_accessibility_summary<-
+      accessibility_min_tt%>%
+        filter(meets_marginal_accessiblility)%>% #only applied to cells which meet marginal accessibility condition
+        group_by(meanMin_tt_bin)%>%
+        applySummary()
+      
+      # accessibility class summary
+      
+      accessibility_class_summary <-
+         accessibility_min_tt%>%
+        group_by(accessibility_class)%>%
+        applySummary()
+      
+      
+      city$accessibility_summaries = 
+        list(POI_accessibility_summary = POI_accessibility_summary,
+             marginal_accessibility_summary = marginal_accessibility_summary,
+             meanMin_tt_accessibility_summary = meanMin_tt_accessibility_summary,
+             accessibility_class_summary = accessibility_class_summary)
+      
+      
+      
+      # write results
+
+      names(city$accessibility_summaries)%>%
+        lapply(function(summaryName){
+          
+          city$accessibility_summaries[[summaryName]]%>%
+            write_csv(city$path%>%paste0("/results/",summaryName,"_",cityName,".csv"))
+
+    })
+      
+      city
+      
+
+    })
+
+```
+
+
+
+
+
 
 

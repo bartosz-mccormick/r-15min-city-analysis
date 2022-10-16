@@ -1159,7 +1159,8 @@ cities<-
                     area = length(grid_id)*cell_area)%>%
           mutate(rel_population = population/city_pop,
                  rel_area = area / sum(city_area))%>%
-          ungroup()
+          ungroup()%>%
+          mutate(city = cityName)
       }
       
       accessibility_min_tt<-
@@ -1194,13 +1195,34 @@ cities<-
         group_by(accessibility_class)%>%
         applySummary()
       
+      # spider and mean min tt (pop weighted)
+
+      spider_summary <- accessibility_min_tt%>%
+        filter(meets_marginal_accessiblility == T)%>%
+        select(c("grid_id",classificationScheme$Class_C%>%unique,"meanMin_tt","population"))%>%
+        pivot_longer(cols = classificationScheme$Class_C%>%unique, names_to = "Class_C",values_to = "tt")%>%
+        filter(!is.na(population)) # remove missing pop
+      
+      meanMin_tt_popweighted<-
+        spider_summary%>%summarise(meanMin_tt_popweighted = weighted.mean(meanMin_tt,population))
+
+      spider_summary <-
+        spider_summary%>%
+        group_by(Class_C)%>%
+        summarise(tt_popweighted = weighted.mean(tt,population))%>%
+        pivot_wider(names_from = Class_C,values_from = tt_popweighted)%>%
+        bind_cols(meanMin_tt_popweighted)%>%
+        mutate(city = cityName)
+      
       
       city$accessibility_summaries = 
         list(POI_accessibility_summary = POI_accessibility_summary,
              marginal_accessibility_summary = marginal_accessibility_summary,
              meanMin_tt_accessibility_summary = meanMin_tt_accessibility_summary,
-             accessibility_class_summary = accessibility_class_summary)
+             accessibility_class_summary = accessibility_class_summary,
+             spider_summary = spider_summary)
       
+    
       
       
       # write results

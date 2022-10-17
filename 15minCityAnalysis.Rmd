@@ -911,7 +911,7 @@ cities<-
 **Example Residential Building Area**
 ```{r echo=FALSE}
 
-cities[[1]]$RB_area_grid%>%head(5)
+cities[[1]]$grid_RB_area%>%head(5)
 
 ```
 
@@ -1244,7 +1244,21 @@ cities<-
 
 
 
+```{r}
+cities%>%
+  lapply(function(city){
+    city$accessibility_summaries
+  })
+```
 
 
+```{r}
+cities%>%
+  lapply(function(city){
+    city$accessibility_summaries$spider_summary
+  })%>%
+  bind_rows()%>%
+  arrange(desc(meanMin_tt_popweighted))
+```
 
 

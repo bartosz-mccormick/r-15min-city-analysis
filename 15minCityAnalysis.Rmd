@@ -523,6 +523,49 @@ All POI access points are assigned to the nearest cell. Duplicate access points 
 
 ```{r results='hide'}
 
+
+# https://dieghernan.github.io/201905_Cast-to-subsegments/
+# https://stackoverflow.com/a/55961448
+
+# stdh_cast_substring <- function(x, to = "MULTILINESTRING") {
+#   ggg <- st_geometry(x)
+# 
+#   if (!unique(st_geometry_type(ggg)) %in% c("POLYGON", "LINESTRING")) {
+#     stop("Input should be  LINESTRING or POLYGON")
+#   }
+#   for (k in 1:length(st_geometry(ggg))) {
+#     sub <- ggg[k]
+#     geom <- lapply(
+#       1:(length(st_coordinates(sub)[, 1]) - 1),
+#       function(i) {
+#         rbind(
+#           as.numeric(st_coordinates(sub)[i, 1:2]),
+#           as.numeric(st_coordinates(sub)[i + 1, 1:2])
+#         )
+#       }
+#     ) %>%
+#       st_multilinestring() %>%
+#       st_sfc()
+# 
+#     if (k == 1) {
+#       endgeom <- geom
+#     }
+#     else {
+#       endgeom <- rbind(endgeom, geom)
+#     }
+#   }
+#   endgeom <- endgeom %>% st_sfc(crs = st_crs(x))
+#   if (class(x)[1] == "sf") {
+#     endgeom <- st_set_geometry(x, endgeom)
+#   }
+# 
+#   if (to == "LINESTRING") {
+#     endgeom <- endgeom %>% st_cast("LINESTRING")
+#   }
+#   return(endgeom)
+# }
+
+
 cities<-
 names(cities)%>%
   setNames(names(cities))%>%
@@ -531,66 +574,129 @@ names(cities)%>%
      
     city<-cities[[cityName]]
     
-    pois_access_points <- city$pois%>%
+
+    
+    # add required fields for processing
+    tempPois<-city$pois%>%
       select(feature_id)%>%
-      st_centroid()%>%
-      st_filter(city$study) #access point must be within study area
+      mutate(area = st_area(.))%>%
+      mutate(tempFilter = area >= poi_access_point_area_threshold | st_geometry_type(.) == "MULTIPOLYGON") # flag POIs meeting area threshold or multipolygon criteria
+ 
+
+    #get street network
+
+    r5r_core<- setup_r5(data_path = city$path, verbose = FALSE)
+
+    city_walk_net <- street_network_to_sf(r5r_core)%>%
+      .$edges%>%
+      filter(walk == T)
     
-    # # add required fields for processing
-    # tempPois<-city$pois%>%
-    #   select(feature_id)%>%
-    #   mutate(area = st_area(.))%>%
-    #   mutate(tempFilter = area >= poi_access_point_area_threshold | st_geometry_type(.) == "MULTIPOLYGON") # flag POIs meeting area threshold or multipolygon criteria
-    # 
-    # #get street network
-    # 
-    # r5r_core<- setup_r5(data_path = city$path, verbose = FALSE)
-    # 
-    # city_walk_net <- street_network_to_sf(r5r_core)%>%
-    #   .$edges%>%
-    #   filter(walk == T)
-    # 
-    # # find entrances for flagged POIs
-    # tempPoisEntrances <- tempPois%>%
-    #   filter(tempFilter == T)%>%
-    #   st_cast("MULTILINESTRING")
-    # 
-    # # narrow search space of street network
-    # city_walk_netTest<-
-    #   city_walk_net%>%
-    #   st_filter(tempPoisEntrances)
-    # 
-    # #entrances
-    # tempEntrances<-
-    #   st_intersection(city_walk_netTest%>%select(walk),
-    #                 tempPoisEntrances)%>%
-    #   select(-walk)
-    # 
-    # #clean up r5r memory usage
-    # rm(city_walk_net)
-    # stop_r5(r5r_core)
-    # rJava::.jgc(R.gc = TRUE)
-    # 
-    # # additionally determine centroid for all polygons (may include some of the flagged features)
+    #clean up r5r memory usage
+    stop_r5(r5r_core)
+    rJava::.jgc(R.gc = TRUE)
+
+    # find entrances for flagged POIs
+    
+    ## subset of POIs for entrance collection
+    tempPoisEntrances <- tempPois%>%
+      filter(tempFilter == T)%>%
+      select(feature_id)%>%
+      st_cast("MULTILINESTRING")%>%
+      st_cast("LINESTRING")
+
+    # narrow search space of street network
+ 
+    city_walk_net<-
+      city_walk_net%>%
+      mutate(intersects_poi = st_intersects(.,tempPoisEntrances))%>%
+      rowwise()%>%
+      mutate(l = length(intersects_poi))%>%
+      ungroup()%>%
+      filter(l>0)%>%
+      select(intersects_poi)
+    
+    
+    
+    # split large POIs into segments, goal being smaller,simpler linestrings which are easier to index
+    # tempPoisEntrances <-
+    #   tempPoisEntrances%>%
+    #   stdh_cast_substring()%>%
+    #   st_cast("LINESTRING")
+    
+    #entrances
+    
+    ## process the street network in chunks (to avoid using too much ram)
+    
+    city_walk_net_index <- seq(1,nrow(city_walk_net))
+    
+    tempEntrances<-
+    split(city_walk_net_index, ceiling(city_walk_net_index/1000))%>% # process in chunks of 1000 street network elements
+      lapply(function(city_walk_net_index_set){
+        city_walk_net[city_walk_net_index_set,]%>% # network elements in chunk
+          st_intersection(tempPoisEntrances[.$intersects_poi%>%unlist()%>%unique,])%>% # perform intersection with POIs that have been already checked to intersect with the street network elements in the chunk 
+          select(feature_id)
+      })%>%
+      bind_rows()
+    
+    tempEntrances<-
+    tempEntrances%>%
+      filter(st_geometry_type(.) %in% c("POINT","MULTIPOINT"))%>% # remove linestrings (e.g. border overlaps perfectly with street network)
+      split(st_geometry_type(.) %in% c("MULTIPOINT"))%>%
+      lapply(function(points){
+        if(all(st_geometry_type(points)=="MULTIPOINT")){
+          #cast multipoints to individual points
+          points%>%st_cast("POINT")
+        }else{
+          points
+        }
+      })%>%
+      bind_rows()
+      
+    
+
+
+    # determine centroid for all other POIs
+    tempCentroids <-
+      tempPois%>%
+      select(feature_id)%>%
+      filter(st_geometry_type(.) != "MULTIPOLYGON")%>%
+      st_centroid()
+    
+    
     # tempCentroids <-
-    #   tempPois%>%
-    #   filter(st_geometry_type(.) != "MULTIPOLYGON")%>%
-    #   st_centroid()
-    # 
-    # pois_access_points <- bind_rows(tempEntrances,tempCentroids)%>%
-    #   select(feature_id)%>%
-    #   st_filter(city$study) #access point must be within study area
-    # 
-    # 
-    # 
-    # pois_access_points
+    # tempPois%>%
+    #   split(st_geometry_type(.) == "MULTIPOLYGON")%>%
+    #   lapply(function(pois){
+    #     if(all(st_geometry_type(pois)!="MULTIPOLYGON")){
+    #       #if not a multipolygon... centroid
+    #       return(pois%>%st_centroid())
+    #     }
+    #     # if multipolgyon, cast to individual polygons and take centroids of those
+    #     
+    #     # NOT IMPLEMENTED - may be misleading. Stick to entrances only for this case
+    #     
+    #   })%>%
+    #   bind_rows()
     
+
+
+    pois_access_points <- bind_rows(tempEntrances,tempCentroids)%>%
+      select(feature_id)%>%
+      st_filter(city$study) #access point must be within study area
+
+    #DEBUG
+    # st_write(pois_access_points,"pois_debug.gpkg","access_points",append=FALSE)
+    # st_write(tempPois,"pois_debug.gpkg","tempPois",append=FALSE)
+    # st_write(city_walk_net%>%select(-intersects_poi),"pois_debug.gpkg","city_walk_net",append=FALSE)
+
+
     grid_centroids <- 
         city$grid%>%
         st_centroid()%>%
         st_transform(crs = 4326)
       
 
+      # CONSIDER SNAP FEATURE
       # append nearest grid cell id
       pois_access_points <-
         pois_access_points%>%
@@ -610,6 +716,7 @@ names(cities)%>%
       #   rename(grid_id = "NearestGridCell")
       
       
+
 
       city
       

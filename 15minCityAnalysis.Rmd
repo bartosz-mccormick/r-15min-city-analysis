@@ -486,7 +486,10 @@ cities<-
                    cellsize = c(100,100),
                    square = F)%>%
         st_sf()%>% #convert to sf object
-        mutate(grid_id = 1:nrow(.))
+        mutate(grid_id = 1:nrow(.))%>%
+        mutate(in_admin = (st_intersects(st_centroid(.)%>%
+                                           st_transform(crs = st_crs(4326)),
+                                         city$admin)%>%lengths)==1) # flag (T/F) if centroid of cell is within admin boundary
       
       city
       
@@ -510,8 +513,6 @@ cities[[1]]$grid%>%head(5)
 ### Access Points
 
 Access points are defined for all POIs. Processing is dependent on the geometry of the POI:
- 
-**ENTRANCES NOT CURRENTLY IMPLEMENTED**
  
 * `POINT`: feature geometry already represents its single access point
 * `POLYGON`: centroid and, if the area is equal or greater than `r poi_access_point_area_threshold/10000` ha, the intersections of the boundary and the street network (representing "entrances")
@@ -701,7 +702,9 @@ names(cities)%>%
       pois_access_points <-
         pois_access_points%>%
         mutate(NearestGridCell = grid_centroids$grid_id[st_nearest_feature(.,grid_centroids)])%>%
-        distinct() # remove multiple access points for a single grid cell
+        # remove multiple access points for a single grid cell
+        st_drop_geometry()%>% # removing geometry necessary for distinct call to work
+        distinct() 
       
       city$pois_access_points <- pois_access_points
 
@@ -764,7 +767,7 @@ cities<-
       
       o_points <- 
         grid_centroids%>%
-        st_filter(city$admin)   #APPLY ADMINISTRATIVE BOUNDARY FILTER!
+        filter(in_admin)   #origin only within admin boundary
         
       o_points<-
         st_coordinates(o_points)%>%
@@ -872,7 +875,6 @@ for (cityName in names(cities)){
       cities[[cityName]]$grid_ttm%>%
         filter(from_id %in% chunk)%>%
         left_join(cities[[cityName]]$pois_access_points%>%
-                    st_drop_geometry()%>%
                     rename(to_id = "NearestGridCell"),
                   by = "to_id")%>%
         filter(!is.na(feature_id))%>% # remove cells without access points
@@ -932,7 +934,7 @@ for (cityName in names(cities)){
 # Population Disaggregation
 
 ## Residential Buildings
-Identifying residential buildlings enables population disaggregation. Areas are aggreagted at grid cells level
+Identifying residential buildlings enables population disaggregation. Areas are aggregated to the grid cells level
 ```{r results = "hide"}
 
 cities<-

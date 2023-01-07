@@ -43,7 +43,7 @@ Where...
 
 * `classificationScheme.csv` specifies the standard POI classification scheme. More details in [POI Preperation].
 * `results` is an empty folder where results of the script will be saved
-* `admin_city.gpkg` delineates area of interest for the study (administrative boundary), optionally consists of smaller administrative units (e.g. districts) with a corresponding `population` field to be used for population disaggregation. More details in [Population Disaggregation].
+* `admin_city.gpkg` delineates area of interest for the study (administrative boundary), optionally consists of smaller administrative units (e.g. districts) with a corresponding `pop` field to be used for population disaggregation. More details in [Population Disaggregation].
 * `osm_study_city.osm.pbf` is an extract of raw OSM data, the basis for the R5R network and POIs. **To avoid edge effects the area must be at least as large as the study area**.
 
 The study area is defined as the bounding box of the administrative boundary buffered by 4000 m.
@@ -87,7 +87,7 @@ grid_resolution <- 100 # (meter) hex. grid
 
 # r5r parameters
 
-r5r_max_walk_time = 20L
+r5r_max_walk_time = 30L
 r5r_walk_speed = 5
 
 # define level of marginal accessibility 
@@ -1115,27 +1115,20 @@ cities<-
     lapply(function(cityName){
       
       city<-cities[[cityName]]
+    
+      population_data<-city$admin
       
-      gpkg_path <-list.files(city$path,"*population*", full.names = T)
-      
-      if(length(gpkg_path) == 0){
-        city$grid <- city$grid%>% mutate(population = NA)
-        return(city) # skip city if data unavailable
-      }
-      
-      population_data<- st_read(gpkg_path)
-      
-      if("population" %in% names(population_data) == F){
-        city$grid <- city$grid%>% mutate(population = NA)
+      if("pop" %in% names(population_data) == F){
+        city$grid <- city$grid%>% mutate(pop = NA)
         return(city) #skip if population field not in data
       }
       
       population_data<-
       population_data%>%
         st_transform(crs = 4326)%>%
-        select(population)%>%
-        mutate(population = replace_na(population,0))%>% # replace NA pop with 0
-        mutate(pop_id = 1:length(population)) #based on city district
+        select(pop)%>%
+        mutate(pop = replace_na(pop,0))%>% # replace NA pop with 0
+        mutate(pop_id = 1:length(pop)) #based on city district
       
       # assign pop_id (city district) to grid cells
       
@@ -1163,7 +1156,7 @@ cities<-
           # join population from each pop_id
           left_join(population_data%>%
                       st_drop_geometry(), by = "pop_id")%>%
-          mutate(pop_r = population/area)%>% 
+          mutate(pop_r = pop/area)%>% 
           mutate(pop_r=ifelse(is.infinite(pop_r),0,pop_r))%>% # replace infinite ratios (non-0 population, 0 area)
           filter(!is.na(pop_id)) #remove cells not within a city district
       
@@ -1173,8 +1166,8 @@ cities<-
       grid<-
       grid%>%
         left_join(pop_ratios%>%select(pop_r,pop_id), by = "pop_id")%>%
-        mutate(population = area*pop_r)%>%
-        select(grid_id,population)
+        mutate(pop = area*pop_r)%>%
+        select(grid_id,pop)
       
       city$grid <-
         city$grid%>%
@@ -1314,14 +1307,14 @@ cities<-
       
       cell_area <- city$accessibility_min_tt%>%st_area()%>%first()%>%units::set_units("m2")%>%as.numeric() #m2
       
-      city_pop <- city$accessibility_min_tt$population%>%sum(na.rm = T)
+      city_pop <- city$accessibility_min_tt$pop%>%sum(na.rm = T)
       city_area <- length(city$accessibility_min_tt$grid_id)*cell_area
       
       applySummary <- function(data){
         data%>%
-          summarise(population = sum(population,na.rm = T),
+          summarise(pop = sum(pop,na.rm = T),
                     area = length(grid_id)*cell_area)%>%
-          mutate(rel_population = population/city_pop,
+          mutate(rel_pop = pop/city_pop,
                  rel_area = area / sum(city_area))%>%
           ungroup()%>%
           mutate(city = cityName)
@@ -1363,17 +1356,17 @@ cities<-
 
       spider_summary <- accessibility_min_tt%>%
         filter(meets_marginal_accessiblility == T)%>%
-        select(c("grid_id",classificationScheme$Class_C%>%unique,"meanMin_tt","population"))%>%
+        select(c("grid_id",classificationScheme$Class_C%>%unique,"meanMin_tt","pop"))%>%
         pivot_longer(cols = classificationScheme$Class_C%>%unique, names_to = "Class_C",values_to = "tt")%>%
-        filter(!is.na(population)) # remove missing pop
+        filter(!is.na(pop)) # remove missing pop
       
       meanMin_tt_popweighted<-
-        spider_summary%>%summarise(meanMin_tt_popweighted = weighted.mean(meanMin_tt,population))
+        spider_summary%>%summarise(meanMin_tt_popweighted = weighted.mean(meanMin_tt,pop))
 
       spider_summary <-
         spider_summary%>%
         group_by(Class_C)%>%
-        summarise(tt_popweighted = weighted.mean(tt,population))%>%
+        summarise(tt_popweighted = weighted.mean(tt,pop))%>%
         pivot_wider(names_from = Class_C,values_from = tt_popweighted)%>%
         bind_cols(meanMin_tt_popweighted)%>%
         mutate(city = cityName)

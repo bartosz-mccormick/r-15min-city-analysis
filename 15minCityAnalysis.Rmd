@@ -946,6 +946,8 @@ cities<-
       
       gpkg_path <-list.files(city$path,list.files(city$path,".pbf$")%>%str_split(".osm.pbf")%>%unlist()%>%first()%>%paste0(".gpkg"),full.names = T)
       
+      grid <- city$grid
+      
       RB_data<-
       st_read(gpkg_path, layer = "multipolygons")%>%
         select(c("building","tourism","landuse","amenity"))%>%
@@ -953,7 +955,14 @@ cities<-
         st_make_valid()%>%
         filter(st_is_valid(.))%>% # if they can't be fixed, remove (negligible)
         filter(st_geometry_type(.) %in% c("POLYGON","MULTIPOLYGON"))%>%
-        mutate(area = st_area(.))
+        st_transform(crs = st_crs(grid))%>%
+        mutate(area = st_area(.))%>%
+        #fix geometries (again, after transform)
+        st_make_valid()%>%
+        filter(st_is_valid(.))%>% # if they can't be fixed, remove (negligible)
+        filter(st_geometry_type(.) %in% c("POLYGON","MULTIPOLYGON"))
+      
+      
 
 
       residential_landuse <- RB_data%>%
@@ -971,7 +980,9 @@ cities<-
       potential_RB <- 
         RB_data %>%
         filter(building %in% c("apartments", "bungalow", "detached", "dormitory", "residential", "house", "terrace", "home", "semidetached_house"))
-        
+      
+
+      
       
       # 2. also consider ...
       
@@ -986,31 +997,82 @@ cities<-
             mutate(building = "residential")
         )
       
+      
+      rm(RB_data)
+
       # 3. Remove buildings that intersect "blacklist" landuse (this can be some POIs like schools) 
       
-      RB <-
+      potential_RB <-
       potential_RB%>%
         mutate(inBlacklist = st_intersects(.,blacklist)%>%lengths)%>%
             filter(inBlacklist == 0)%>% # intersects with "residential" landuse
-        select(building,area)%>%
-       st_centroid()
-     
-     grid <- city$grid%>%st_transform(crs = st_crs(4326))
-     
-     RB$grid_id <-
-        grid$grid_id[
-          st_within(RB,grid)%>%
-            lapply(function(index){
-              ifelse(length(index == 1),index,NA)})%>%
-            unlist() # if no match, replace empty vector with NA
-        ]
-     
-     # residential building area aggregated at grid level
-     city$grid_RB_area <- RB%>%
-       st_drop_geometry()%>%
-       group_by(grid_id)%>%
-       summarise(area = sum(units::set_units(area,"m2")%>%as.numeric()))
+        select(building)%>%
+        mutate(RB_id = 1:length(building))
       
+
+      
+      # Intersect RB with grid, assign each RB a vector of indices corresponding to the grid cells it intersects with
+      
+      potential_RB$grid_index <-
+        st_intersects(potential_RB,grid)
+      
+
+      
+      # potential RB that intersect multiple cells...
+      
+      multicell_potential_RB <-
+        potential_RB%>%
+        filter(lengths(grid_index) != 1)
+      
+      
+      multicell_potential_RB_index <- seq(1,nrow(multicell_potential_RB))
+
+      RB_area<-
+      split(multicell_potential_RB_index, ceiling(multicell_potential_RB_index/5000))%>% # process in chunks of 5000 multicell RBs
+        lapply(function(multicell_potential_RB_index_set){
+          
+          # indices of cells that intersect with RB in the chunk
+          
+          chunk_grid_indices_multi <- multicell_potential_RB$grid_index[multicell_potential_RB_index_set]%>%unlist()
+
+          # grid cells relevant to chunk
+          chunk_grid_multi <- grid[chunk_grid_indices_multi,]
+          
+          chunk_multicell_potential_RB <- multicell_potential_RB%>%select(-grid_index)%>%.[multicell_potential_RB_index_set,]
+          
+          chunk_multicell_potential_RB%>%
+            st_intersection(chunk_grid_multi)%>%
+            mutate(area = st_area(.))%>%
+            st_drop_geometry()%>%
+            group_by(grid_id)%>%
+            summarise(area = sum(as.numeric(area,units = "m2")))
+        })%>%
+        bind_rows()%>%
+        group_by(grid_id)%>%
+        summarise(area = sum(area))
+    
+    
+      # potential RB that intersect a single cell...
+      # are assigned the ID of the grid cell 
+      
+      
+      RB_area<-
+        bind_rows(RB_area,
+                  potential_RB%>%
+                    filter(lengths(grid_index) == 1)%>%
+                    mutate(grid_id = grid$grid_id[unlist(grid_index)])%>%
+                    select(-grid_index)%>%
+                    mutate(area = st_area(.))%>%
+                    st_drop_geometry()%>%
+                    group_by(grid_id)%>%
+                    summarise(area = sum(area))%>%
+                    mutate(area = as.numeric(area,units = "m2")))%>%
+        group_by(grid_id)%>%
+        summarise(area = sum(area))
+      
+      
+      city$grid <- city$grid%>%left_join(RB_area, by = "grid_id")
+
 
       city
     })
@@ -1020,8 +1082,7 @@ cities<-
 **Example Residential Building Area**
 ```{r echo=FALSE}
 
-cities[[1]]$grid_RB_area%>%head(5)
-
+cities[[1]]$grid%>%head(5)
 ```
 
 ## Population Data
@@ -1043,14 +1104,14 @@ cities<-
       gpkg_path <-list.files(city$path,"*population*", full.names = T)
       
       if(length(gpkg_path) == 0){
-        city$grid_population <- list(NULL)
+        city$grid <- city$grid%>% mutate(population = NA)
         return(city) # skip city if data unavailable
       }
       
       population_data<- st_read(gpkg_path)
       
       if("population" %in% names(population_data) == F){
-        city$grid_population <- list(NULL)
+        city$grid <- city$grid%>% mutate(population = NA)
         return(city) #skip if population field not in data
       }
       
@@ -1075,12 +1136,10 @@ cities<-
             unlist() # if no match, replace empty vector with NA
         ]
       
-      # join residential building area to grid
-      
       grid<-
         grid %>%
-        st_drop_geometry()%>%
-        left_join(city$grid_RB_area, by = "grid_id")
+        st_drop_geometry()
+      
       
       pop_ratios <-
         grid%>%
@@ -1102,7 +1161,9 @@ cities<-
         mutate(population = area*pop_r)%>%
         select(grid_id,population)
       
-      city$grid_population <- grid%>%as_tibble()
+      city$grid <-
+        city$grid%>%
+        left_join(grid, by = "grid_id")
       
       city
       
@@ -1203,27 +1264,6 @@ cities<-
       #                 nClass_B_bin))
     
 
-
-      
-      
-
-        
-
-      
-      # ENRICH W POPULATION DATA
-      
-      grid_population <- city$grid_population
-      
-      #join population data
-      if(!is_tibble(grid_population)){ #if population data is unavailable
-        accessibility_min_tt <- accessibility_min_tt%>%
-          mutate(population = NA)
-        
-      } else{
-        
-        accessibility_min_tt <- accessibility_min_tt%>%
-          left_join(city$grid_population, by = "grid_id")
-      }
       
       
       st_write(accessibility_min_tt,

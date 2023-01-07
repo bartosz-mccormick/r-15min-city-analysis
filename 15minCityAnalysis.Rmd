@@ -1,6 +1,6 @@
 ---
-title: "R5R-based Accessibility Analysis Framework"
-subtitle: "A case study of Amsterdam, Ghent, Madrid, Milan, and Munich"
+title: "15 MC Analysis"
+subtitle: "Berlin and Munich"
 output: 
   html_notebook:
     code_folding: hide
@@ -33,79 +33,22 @@ In the working directory populate the `cities` folder in the following way:
 ```
 > classificationScheme.csv 
 > city
+  > results
   > admin_city.gpkg
   > osm_study_city.osm.pbf
+  > sample-feed.gtfs
 ```
 
 Where...
 
 * `classificationScheme.csv` specifies the standard POI classification scheme. More details in [POI Preperation].
-* `admin_city.gpkg` delineates area of interest for the study (administrative boundary)
-* `osm_study_city.osm.pbf` is an extract of raw OSM data, the basis for the R5R network and POIs.
-**To avoid edge effects this area must be at least as large as the study area**.
+* `results` is an empty folder where results of the script will be saved
+* `admin_city.gpkg` delineates area of interest for the study (administrative boundary), optionally consists of smaller administrative units (e.g. districts) with a corresponding `population` field to be used for population disaggregation. More details in [Population Disaggregation].
+* `osm_study_city.osm.pbf` is an extract of raw OSM data, the basis for the R5R network and POIs. **To avoid edge effects the area must be at least as large as the study area**.
 
 The study area is defined as the bounding box of the administrative boundary buffered by 4000 m.
 
-## Additional Guidance for Preparing `.pbf` Files
-
-The `.pbf` file format is highly compressed, enabling bulk exports of OSM data. This is well suited
-for preparing POIs and is an input for R5R street network network generation. [Protomaps](https://protomaps.com/downloads/osm)
-is a good provider of this data as they allow for the area of the extract to be set by the user.
-However, these `.pbf` files may not include all OSM keys that are relevant for POI preparation.
-For this case study, a Europe-wide `.pbf` file was sourced from [Geofabrik](https://download.geofabrik.de/europe.html) on September 14, 2022. 
-A Europe-wide file was downloaded as some study areas overlapped multiple geographic regions. [Osmosis](https://wiki.openstreetmap.org/wiki/Osmosis) used for cropping the file into smaller, study-area-specific `.pbf` files. This may not be necessary in all cases, but excessively large `.pbf` files will negatively impact performance, particularly R5R. 
-
-### Osmosis Processing
-
-Osmosis processing was done in two steps:
-
-1. Crop the Europe-wide `.pbf` file to an area **larger** than the study area. In this case: the bounding box of the administrative boundary buffered by 5000 m
-2. Crop the `.pbf` file from step 1 to the study area, with `completeWays` and `completeRelations` enabled
-
-As previously mentioned, cropping is applied to improve performance. Enabling `completeWays` and 
-`completeRelations` prevents issues during R5R network generation. The two-step procedure is 
-implemented to avoid loading the entire Europe-wide `.pbf` file into a temporary folder [(forum post
-with more information)](https://dev.openstreetmap.narkive.com/MbbS199a/osm-osmosis-bug-when-using-completeways-option#post7). 
-
-**Osmosis Commands**
-```
-Step 1:
-# Amsterdam
-osmosis --read-pbf europe-latest.osm.pbf --bounding-box top=52.475590 left=4.656887 bottom=52.233411 right=5.152123 --write-pbf osm_study_buf_amsterdam.osm.pbf
-  
-<!-- # Freising -->
-<!-- osmosis --read-pbf europe-latest.osm.pbf --bounding-box top=48.49398 left=11.57318 bottom=48.28630 right=11.85997 --write-pbf osm_study_buf_freising.osm.pbf -->
-
-# Ghent
-osmosis --read-pbf europe-latest.osm.pbf --bounding-box top=51.230173 left=3.516289 bottom=50.936609 right=3.915450 --write-pbf osm_study_buf_ghent.osm.pbf
-
-# Milan
-osmosis --read-pbf europe-latest.osm.pbf --bounding-box top=45.580727 left=8.978080 bottom=45.342766 right=9.340711 --write-pbf osm_study_buf_milan.osm.pbf
-
-# Munich
-osmosis --read-pbf europe-latest.osm.pbf --bounding-box top=48.29310 left=11.29615 bottom=48.01718 right=11.78982 --write-pbf osm_study_buf_munich.osm.pbf
-
-
-Step 2:
-
-# Amsterdam
-osmosis --read-pbf osm_study_buf_amsterdam.osm.pbf --bounding-box top=52.46660 left=4.67130 bottom=52.24239 right=5.13753 completeWays=yes completeRelations=yes --write-pbf osm_study_amsterdam.osm.pbf
-  
-<!-- # Freising -->
-<!-- osmosis --read-pbf osm_study_buf_freising.osm.pbf --bounding-box top=48.48496 left=11.58663 bottom=48.29530 right=11.84648 completeWays=yes completeRelations=yes --write-pbf osm_study_freising.osm.pbf -->
-
-# Ghent
-osmosis --read-pbf osm_study_buf_ghent.osm.pbf --bounding-box top=51.221574 left=3.529212 bottom=50.945914 right=3.901797 completeWays=yes completeRelations=yes --write-pbf osm_study_ghent.osm.pbf
-
-# Milan
-osmosis --read-pbf osm_study_buf_milan.osm.pbf --bounding-box top=45.571751 left=8.990640 bottom=45.351561 right=9.328193 completeWays=yes completeRelations=yes --write-pbf osm_study_milan.osm.pbf
-
-# Munich
-osmosis --read-pbf osm_study_buf_munich.osm.pbf --bounding-box top=48.28410 left=11.30926 bottom=48.02607 right=11.77644 completeWays=yes completeRelations=yes --write-pbf osm_study_munich.osm.pbf
-
-
-```
-## Code Structure 
+## Input Parameters 
 ```{r results='hide'}
 cities<-
 list.dirs("./cities",recursive = F,full.names = T)%>%
@@ -114,10 +57,10 @@ list.dirs("./cities",recursive = F,full.names = T)%>%
     city <-
       list(path = path,
            admin = list.files(path,"admin",full.names = T)%>%
-             st_read()%>%
-             select(name)
+             st_read()
            )
     city$study <- city$admin%>%
+      st_union()%>%
       st_transform(crs =3035)%>%
       st_buffer(4000,joinStyle = "BEVEL")%>% # 4000 m = 15 min @ 16 km/hr
       st_transform(crs = 4326)%>%
@@ -152,6 +95,78 @@ r5r_walk_speed = 5
 marginal_accessibility_threshold <- 20
 
 ```
+
+
+## Additional Guidance for Preparing `.pbf` Files
+
+The `.pbf` file format is highly compressed, enabling bulk exports of OSM data. This is well suited
+for preparing POIs and is an input for R5R street network network generation. [Protomaps](https://protomaps.com/downloads/osm)
+is a good provider of this data as they allow for the area of the extract to be set by the user.
+However, these `.pbf` files may not include all OSM keys that are relevant for POI preparation.
+For this case study, a Germany-wide `.pbf` file was sourced from [Geofabrik](https://download.geofabrik.de/europe.html) on January 6, 2023. [Osmosis](https://wiki.openstreetmap.org/wiki/Osmosis) was used for cropping the file into smaller, study-area-specific `.pbf` files. This may not be necessary in all cases, but excessively large `.pbf` files will negatively impact performance, particularly R5R. 
+
+### Osmosis Processing
+
+Osmosis processing was done in two steps:
+
+1. Crop the Germany-wide `.pbf` file to an area **larger** than the study area. In this case: the bounding box of the administrative boundary buffered by 5000 m
+2. Crop the `.pbf` file from step 1 to the study area, with `completeWays` and `completeRelations` enabled
+
+As previously mentioned, cropping is applied to improve performance. Enabling `completeWays` and 
+`completeRelations` prevents issues during R5R network generation. The two-step procedure is 
+implemented to avoid loading the entire Europe-wide `.pbf` file into a temporary folder [(forum post
+with more information)](https://dev.openstreetmap.narkive.com/MbbS199a/osm-osmosis-bug-when-using-completeways-option#post7). 
+
+**Bounding Box Coordinates**
+
+```{r}
+
+osmosis_bbox <-
+cities%>%
+  lapply(function(city){
+    
+    admin_union<-
+    
+    city$admin%>%
+    st_union()%>%
+    st_transform(crs =3035)
+    
+    list(step1 = admin_union%>%st_buffer(5000,joinStyle = "BEVEL")%>% # 4000 m = 15 min @ 16 km/hr
+           st_transform(crs = 4326)%>%
+           st_bbox(),
+         step2 = admin_union%>%st_buffer(4000,joinStyle = "BEVEL")%>% # 4000 m = 15 min @ 16 km/hr
+           st_transform(crs = 4326)%>%
+           st_bbox())
+
+  })
+
+osmosis_bbox
+```
+
+**Osmosis Commands**
+
+```{r}
+names(osmosis_bbox)%>%
+  set_names(.)%>%
+  lapply(function(cityName){
+    names(osmosis_bbox[[cityName]])%>%
+      set_names(.)%>%
+      lapply(function(stepName){
+        paste("osmosis --read-pbf germany-latest.osm.pbf --bounding-box",
+              paste0("top=", osmosis_bbox[[cityName]][[stepName]]$ymax),
+              paste0("left=", osmosis_bbox[[cityName]][[stepName]]$xmin),
+              paste0("bottom=", osmosis_bbox[[cityName]][[stepName]]$ymin),
+              paste0("right=", osmosis_bbox[[cityName]][[stepName]]$xmax),
+              "--write-pbf",
+              ifelse(stepName == "step1",
+                     paste0("osm_study_buf_",cityName,".osm.pbf"),
+                     paste0("osm_study_",cityName,".osm.pbf")),
+              sep =" ")
+        
+      })
+  })
+```
+
 
 ## Prepare R5R Networks
 
